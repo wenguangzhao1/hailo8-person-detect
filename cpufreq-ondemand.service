@@ -1,0 +1,13 @@
+[Unit]
+Description=Set CPU ondemand governor tuning for fan noise reduction
+After=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 95 > /sys/devices/system/cpu/cpufreq/ondemand/up_threshold'
+ExecStart=/bin/bash -c 'echo 1 > /sys/devices/system/cpu/cpufreq/ondemand/sampling_down_factor'
+ExecStart=/bin/bash -c 'echo 1 > /sys/devices/system/cpu/cpufreq/ondemand/io_is_busy'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

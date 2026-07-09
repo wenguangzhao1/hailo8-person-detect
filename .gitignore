@@ -1,0 +1,20 @@
+# Output images
+output/
+
+# Logs
+*.log
+hailort.log
+hailo.web.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
