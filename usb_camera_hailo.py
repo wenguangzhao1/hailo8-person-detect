@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -81,7 +82,7 @@ HEF_PATH = "/usr/share/hailo-models/yolov8s_h8l.hef"
 
 # Inference config
 INPUT_SIZE = 640
-CONF_THRESHOLD = 0.35
+CONF_THRESHOLD = 0.40
 
 # Colors for classes (pre-generated)
 CLASS_COLORS = np.random.randint(80, 255, size=(len(COCO_CLASSES), 3), dtype=np.uint8)
@@ -157,6 +158,70 @@ state = DetectionState()
 
 # Output directory (set by run_detection, used by Flask routes)
 _output_dir = None
+
+
+# ── Database functions ────────────────────────────────────────────────
+def init_database(output_dir):
+    """Initialize SQLite database with optimized indexes."""
+    db_path = os.path.join(output_dir, "detections.db")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Create table with all metadata
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS detections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            session_id INTEGER NOT NULL,
+            frame_count INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            bbox_x1 INTEGER NOT NULL,
+            bbox_y1 INTEGER NOT NULL,
+            bbox_x2 INTEGER NOT NULL,
+            bbox_y2 INTEGER NOT NULL,
+            image_width INTEGER NOT NULL,
+            image_height INTEGER NOT NULL,
+            fps REAL NOT NULL,
+            infer_ms REAL NOT NULL,
+            detection_count INTEGER NOT NULL
+        )
+    """)
+
+    # Create indexes for fast queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_confidence ON detections(confidence)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON detections(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_session ON detections(session_id)")
+
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def save_detection_metadata(output_dir, filename, timestamp, session_id, frame_count,
+                            detections, image_size, fps, infer_ms):
+    """Save detection metadata to SQLite database."""
+    db_path = os.path.join(output_dir, "detections.db")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Insert each detection separately (one row per detection)
+    for det in detections:
+        label, confidence, x1, y1, x2, y2 = det
+        cursor.execute("""
+            INSERT INTO detections
+            (filename, timestamp, session_id, frame_count, confidence,
+             bbox_x1, bbox_y1, bbox_x2, bbox_y2, image_width, image_height,
+             fps, infer_ms, detection_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            filename, timestamp, session_id, frame_count, confidence,
+            x1, y1, x2, y2, image_size[0], image_size[1],
+            fps, infer_ms, len(detections)
+        ))
+
+    conn.commit()
+    conn.close()
 
 
 # ── Flask app ──────────────────────────────────────────────────────────
@@ -771,6 +836,79 @@ def api_image(filename):
     from flask import send_file
     return send_file(fpath, mimetype='image/jpeg')
 
+@app.route('/api/metadata')
+def api_metadata():
+    """Query detection metadata with confidence filtering via SQLite."""
+    global _output_dir
+    if _output_dir is None or not os.path.isdir(_output_dir):
+        return jsonify({"metadata": [], "total": 0})
+
+    min_conf = request.args.get('min_conf', 0.0, type=float)
+    max_conf = request.args.get('max_conf', 1.0, type=float)
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 100, type=int)
+
+    db_path = os.path.join(_output_dir, "detections.db")
+    if not os.path.exists(db_path):
+        return jsonify({"metadata": [], "total": 0, "message": "detections.db not found"})
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Count total matching records
+        cursor.execute("""
+            SELECT COUNT(DISTINCT filename)
+            FROM detections
+            WHERE confidence >= ? AND confidence <= ?
+        """, (min_conf, max_conf))
+        total = cursor.fetchone()[0]
+
+        # Query paginated results
+        offset = (page - 1) * per_page
+        cursor.execute("""
+            SELECT DISTINCT filename, timestamp, session_id, frame_count,
+                   confidence, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+                   image_width, image_height, fps, infer_ms, detection_count
+            FROM detections
+            WHERE confidence >= ? AND confidence <= ?
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?
+        """, (min_conf, max_conf, per_page, offset))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Format results
+        metadata = []
+        for row in rows:
+            metadata.append({
+                "filename": row[0],
+                "timestamp": row[1],
+                "session_id": row[2],
+                "frame_count": row[3],
+                "confidence": row[4],
+                "bbox": [row[5], row[6], row[7], row[8]],
+                "image_size": [row[9], row[10]],
+                "fps": row[11],
+                "infer_ms": row[12],
+                "detection_count": row[13]
+            })
+
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(1, min(page, total_pages))
+
+        return jsonify({
+            "metadata": metadata,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "filters": {"min_conf": min_conf, "max_conf": max_conf}
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "metadata": [], "total": 0}), 500
+
 
 # ── Detection functions ────────────────────────────────────────────────
 
@@ -901,6 +1039,10 @@ def run_detection(output_dir=None, target_fps=10, conf_thresh=0.35, port=5000):
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+        # Initialize SQLite database
+        db_path = init_database(output_dir)
+        print(f"✓ Database initialized: {db_path}")
+
         # Session management: increment counter but DO NOT delete old session files
         session_file = os.path.join(output_dir, ".session_id")
         try:
@@ -1023,8 +1165,16 @@ def run_detection(output_dir=None, target_fps=10, conf_thresh=0.35, port=5000):
                 if should_save:
                     draw_timestamp(annotated)
                     run_detection._last_saved_state = {"feat": feat, "bbox": [x1, y1, x2, y2]}
-                    path = os.path.join(output_dir, f"sess_{sid:04d}_f{frame_count:05d}.jpg")
+                    filename = f"sess_{sid:04d}_f{frame_count:05d}.jpg"
+                    path = os.path.join(output_dir, filename)
                     cv2.imwrite(path, annotated)
+
+                    # Save metadata to SQLite database
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                    save_detection_metadata(
+                        output_dir, filename, timestamp, sid, frame_count,
+                        detections, [cam_w, cam_h], avg_fps, infer_ms
+                    )
 
             frame_count += 1
 
@@ -1065,8 +1215,8 @@ Examples:
                         help="Target processing FPS (default: 10)")
     parser.add_argument("--port", type=int, default=5000,
                         help="Web dashboard port (default: 5000)")
-    parser.add_argument("--conf-thresh", type=float, default=0.35,
-                        help="Confidence threshold 0-1 (default: 0.35)")
+    parser.add_argument("--conf-thresh", type=float, default=0.40,
+                        help="Confidence threshold 0-1 (default: 0.40)")
     args = parser.parse_args()
 
     run_detection(
