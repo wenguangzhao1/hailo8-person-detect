@@ -935,8 +935,20 @@ def load_hailo_model(hef_path):
     return device, cfg, inp_name, out_name, out_shape
 
 
-def init_camera(device="/dev/video0", width=640, height=480):
+def find_camera():
+    """Auto-detect USB camera device (fallback: /dev/video0 → /dev/video1 → ...)."""
+    for dev in ["/dev/video0", "/dev/video1", "/dev/video2"]:
+        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+        if cap.isOpened():
+            cap.release()
+            return dev
+    return "/dev/video0"  # default, will fail with clear error
+
+
+def init_camera(device=None, width=640, height=480):
     """Open USB camera via V4L2."""
+    if device is None:
+        device = find_camera()
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
         state.mark_error(f"无法打开摄像头 {device}")
